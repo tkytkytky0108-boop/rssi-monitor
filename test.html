@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 WIRELESS SIGNAL ANALYZER (Bluetooth Mode)</title>
+    <script src="chart.js"></script>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        header { background: #161b22; padding: 10px 20px; border-bottom: 2px solid #21262d; display: flex; justify-content: space-between; align-items: center; height: 40px; z-index: 10; }
+        h1 { margin: 0; font-size: 16px; color: #58a6ff; font-weight: 600; letter-spacing: 1px; }
+        button { padding: 6px 15px; font-size: 13px; font-weight: bold; cursor: pointer; border-radius: 6px; border: 1px solid #0052cc; background: #0052cc; color: white; transition: all 0.2s; border: none; }
+        button:hover { background: #0066ff; }
+        button:disabled { background: #21262d; color: #8b949e; cursor: default; }
+        .main-content { position: relative; flex-grow: 1; height: calc(100vh - 62px); background: #0d1117; padding: 20px; box-sizing: border-box; }
+        .chart-container { width: 100%; height: 100%; }
+        
+        /* 右上の浮かぶ凡例・数値パネル */
+        .floating-display-panel { position: absolute; top: 30px; right: 30px; background: rgba(22, 27, 34, 0.85); border: 2px solid #30363d; border-radius: 8px; padding: 12px 22px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); backdrop-filter: blur(4px); z-index: 5; min-width: 220px; text-align: left; }
+        .panel-header { font-size: 11px; color: #8b949e; font-weight: bold; text-align: center; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1.5px; }
+        
+        .device-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .legend-indicator { width: 12px; height: 12px; border-radius: 3px; display: inline-block; margin-right: 8px; }
+        .device-name { font-size: 13px; font-weight: 500; color: #c9d1d9; }
+        .value-display { font-size: 32px; font-weight: bold; line-height: 1; margin-left: 10px; }
+        .unit { font-size: 14px; color: #8b949e; margin-left: 3px; font-weight: normal; }
+
+        .time-display { font-size: 11px; color: #8b949e; margin-top: 10px; border-top: 1px solid #21262d; padding-top: 6px; text-align: center; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>📡 ESP32 WIRELESS SIGNAL ANALYZER (BLE MODE)</h1>
+    <button id="btn">Bluetoothで接続する</button>
+</header>
+
+<div class="main-content">
+    <div class="floating-display-panel">
+        <div class="panel-header" id="stat">BLE STANDBY</div>
+        
+        <div class="device-row">
+            <div style="display: flex; align-items: center;">
+                <div class="legend-indicator" style="background-color: #58a6ff;"></div>
+                <span class="device-name">基準機 (BASE)</span>
+            </div>
+            <div class="value-display" style="color: #58a6ff;">--<span class="unit">dBm</span></div>
+        </div>
+        
+        <div class="device-row">
+            <div style="display: flex; align-items: center;">
+                <div class="legend-indicator" style="background-color: #ffaa00;"></div>
+                <span class="device-name">検証機 (TEST)</span>
+            </div>
+            <div class="value-display" style="color: #ffaa00;"><span id="data-test">---</span><span class="unit">dBm</span></div>
+        </div>
+        
+        <div class="time-display">
+            LAST UPD: <span id="time-text">--:--:--</span>
+        </div>
+    </div>
+
+    <div class="chart-container">
+        <canvas id="rssiChart"></canvas>
+    </div>
+</div>
+
+<script>
+let bluetoothDevice;
+let characteristic;
+const maxDataPoints = 60; 
+
+// 【ノイズ対策】EMA（指数移動平均）用の変数
+let lastEmaValue = null;
+const emaAlpha = 0.25; // ★フィルターの効き具合（0.25＝ノイズを消しつつ1秒で追従する黄金比）
+
+// 【新機能】Chart.jsの「プラグイン」を使って、背景に良好エリアの帯を描画する
+const bgBandPlugin = {
+    id: 'customCanvasBackgroundColor',
+    beforeDraw: (chart) => {
+        const {ctx, chartArea: {top, bottom, left, right}, scales: {y}} = chart;
+        ctx.save();
+        // 良好エリア（-30 から -50）のY軸座標を計算
+        const yTop = y.getPixelForValue(-30);
+        const yBottom = y.getPixelForValue(-50);
+        
+        // 薄いグリーンの帯を描画
+        ctx.fillStyle = 'rgba(0, 255, 102, 0.06)';
+        ctx.fillRect(left, yTop, right - left, yBottom - yTop);
+        
+        // 帯の中に「良好エリア / GOOD ZONE」の文字をうっすら描く
+        ctx.fillStyle = 'rgba(0, 255, 102, 0.3)';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.fillText('良好エリア (GOOD ZONE)', left + 15, yTop + 20);
+        ctx.restore();
+    }
+};
+
+const ctx = document.getElementById('rssiChart').getContext('2d');
+const rssiChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: [],
+        datasets: [
+            {
+                label: '基準機 (BASE)',
+                data: [],
+                borderColor: '#58a6ff', borderWidth: 3, pointRadius: 0, tension: 0.3, fill: false
+            },
+            {
+                label: '検証機 (TEST)',
+                data: [],
+                borderColor: '#ffaa00',
+                backgroundColor: 'rgba(255, 170, 0, 0.02)',
+                borderWidth: 3, pointRadius: 2, tension: 0.3, fill: true
+            }
+        ]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+            y: {
+                min: -100, max: -30,
+                grid: { color: '#1f242c' }, 
+                ticks: { color: '#8b949e' },
+                title: { display: true, text: 'SIGNAL STRENGTH (dBm)', color: '#8b949e' }
+            },
+            x: { grid: { color: '#1f242c' }, ticks: { color: '#8b949e', font: { size: 10 } } }
+        }
+    },
+    plugins: [bgBandPlugin] // 帯描画プラグインを有効化
+});
+
+// Bluetooth接続処理
+document.getElementById('btn').addEventListener('click', async () => {
+    const stat = document.getElementById('stat');
+    try {
+        stat.innerText = "PAIRING...";
+        
+        // ESP32が発信する「UUID」を指定してデバイスを探す
+        // ※このUUIDはステップ③でESP32に書き込むものと完全一致させます
+        const serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+        const characteristicUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+        bluetoothDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [serviceUuid] }]
+        });
+
+        const server = await bluetoothDevice.gatt.connect();
+        const service = await server.getPrimaryService(serviceUuid);
+        characteristic = await service.getCharacteristic(characteristicUuid);
+
+        // データが届いたときに実行するイベントを設定
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged', handleData);
+
+        stat.innerText = "BLE LIVE";
+        stat.style.color = "#00ff66";
+        document.getElementById('btn').disabled = true;
+    } catch (error) {
+        console.error(error);
+        stat.innerText = "BLE ERROR";
+        stat.style.color = "#ff7b72";
+    }
+});
+
+// Bluetoothからデータ（文字）をキャッチしたときの処理
+function handleData(event) {
+    const value = event.target.value;
+    const decoder = new TextDecoder('utf-8');
+    let line = decoder.decode(value).trim();
+
+    if (line) {
+        let dataParts = line.split(/[\s,]+/);
+        for (let part of dataParts) {
+            const rawRssi = parseInt(part, 10);
+            
+            // シリアルプロッタ用のダミー（-20, -90）をここで排除
+            if (!isNaN(rawRssi) && rawRssi !== -20 && rawRssi !== -90) {
+                if (rawRssi >= -100 && rawRssi <= -30) {
+                    
+                    // 【★EMAフィルター計算処理】
+                    let processedRssi;
+                    if (lastEmaValue === null) {
+                        processedRssi = rawRssi; // 初回はそのまま採用
+                    } else {
+                        // EMAの公式: (最新値 * Alpha) + (前回値 * (1 - Alpha))
+                        processedRssi = (rawRssi * emaAlpha) + (lastEmaValue * (1 - emaAlpha));
+                    }
+                    lastEmaValue = processedRssi; // 次回のために保存
+
+                    // UI更新関数へ（生データと、丸めた処理データを両方渡す）
+                    updateUI(rawRssi, Math.round(processedRssi));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// 画面表示・グラフの書き換え
+function updateUI(rawValues, filteredValue) {
+    const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    // 1. 右上の数値パネルには「生データ（rawValues）」を表示してピコピコ動かす
+    document.getElementById('data-test').innerText = rawValues;
+    document.getElementById('time-text').innerText = now;
+    
+    // 2. グラフには「フィルター後の値（filteredValue）」を追加して滑らかにする
+    rssiChart.data.labels.push(now);
+    rssiChart.data.datasets[1].data.push(filteredValue); // 検証機のグラフ
+    
+    if (rssiChart.data.labels.length > maxDataPoints) {
+        rssiChart.data.labels.shift();
+        rssiChart.data.datasets[1].data.shift();
+    }
+    
+    rssiChart.update();
+}
+</script>
+</body>
+</html>
