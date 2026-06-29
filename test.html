@@ -215,10 +215,11 @@ function updateUI(rawValues, filteredValue) {
     
     if (rssiChart.data.labels.length > maxDataPoints) {
         rssiChart.data.labels.shift();
+        rssiChart.data.datasets[0].data.shift();
         rssiChart.data.datasets[1].data.shift();
     }
     
-    rssiChart.update();
+    rssiChart.update('none');
 }
 </script>
 </body>
